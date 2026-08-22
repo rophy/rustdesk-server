@@ -4,7 +4,22 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 
-type Collector = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
+pub type Collector = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
+
+pub fn encode_metrics(gauges: &[(prometheus::Gauge, f64)]) -> String {
+    use prometheus::Encoder;
+    for (gauge, value) in gauges {
+        gauge.set(*value);
+    }
+    let encoder = prometheus::TextEncoder::new();
+    let metric_families = prometheus::gather();
+    let mut buffer = Vec::new();
+    if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
+        log::error!("Failed to encode metrics: {}", e);
+        return String::new();
+    }
+    String::from_utf8(buffer).unwrap_or_default()
+}
 
 pub async fn start_metrics_server(
     bind_addr: Option<IpAddr>,
