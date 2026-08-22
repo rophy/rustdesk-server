@@ -904,6 +904,27 @@ impl RendezvousServer {
         }
     }
 
+    async fn send_to_ws_peer(&self, peer_id: &str, msg: RendezvousMessage) -> bool {
+        let sink = self.ws_peers.lock().await.remove(peer_id);
+        if let Some(mut s) = sink {
+            if let Ok(bytes) = msg.write_to_bytes() {
+                let ok = match &mut s {
+                    Sink::TcpStream(tcp) => tcp.send(Bytes::from(bytes)).await.is_ok(),
+                    Sink::Ws(ws) => ws.send(tungstenite::Message::Binary(bytes)).await.is_ok(),
+                };
+                if ok {
+                    self.ws_peers.lock().await.insert(peer_id.to_owned(), s);
+                    return true;
+                }
+                log::warn!("Failed to send to WS peer {}, removing sink", peer_id);
+            }
+            // send failed or serialize failed — sink is dropped (not re-inserted)
+            true // we had a sink, just failed; don't fall back to UDP
+        } else {
+            false // no WS sink, caller should use UDP
+        }
+    }
+
     #[inline]
     async fn send_to_tcp_sync(
         &mut self,
