@@ -570,18 +570,14 @@ impl RendezvousServer {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
                     let target_id = rf.id.clone();
-                    log::info!("RequestRelay from {:?} for target '{}'", addr, target_id);
                     if let Some(peer) = self.pm.get_in_memory(&target_id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
                         if !self.send_to_ws_peer(&target_id, msg_out.clone()).await {
                             let peer_addr = peer.read().await.socket_addr;
-                            log::info!("RequestRelay: falling back to UDP for '{}' at {:?}", target_id, peer_addr);
                             self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
                         }
-                    } else {
-                        log::info!("RequestRelay: target '{}' not found in memory", target_id);
                     }
                     return (false, None);
                 }
@@ -746,8 +742,7 @@ impl RendezvousServer {
                     // Store the WS sink for this peer and signal persistent mode
                     if let Some(s) = sink.take() {
                         self.ws_peers.lock().await.insert(id.clone(), s);
-                        log::info!("Peer {} registered via TCP/WS, ws_peers count={}", id,
-                            self.ws_peers.lock().await.len());
+                        log::info!("Peer {} registered via TCP/WS", id);
                     }
                     return (false, Some(id));
                 }
@@ -1050,22 +1045,14 @@ impl RendezvousServer {
     }
 
     async fn send_to_ws_peer(&self, peer_id: &str, msg: RendezvousMessage) -> bool {
-        let ws_peer_count = self.ws_peers.lock().await.len();
-        log::info!(
-            "send_to_ws_peer: looking up peer_id={}, ws_peers count={}",
-            peer_id,
-            ws_peer_count
-        );
         let sink = self.ws_peers.lock().await.remove(peer_id);
         if let Some(mut s) = sink {
-            log::info!("send_to_ws_peer: found sink for peer {}", peer_id);
             if let Ok(bytes) = msg.write_to_bytes() {
                 let ok = match &mut s {
                     Sink::TcpStream(tcp) => tcp.send(Bytes::from(bytes)).await.is_ok(),
                     Sink::Ws(ws) => ws.send(tungstenite::Message::Binary(bytes)).await.is_ok(),
                 };
                 if ok {
-                    log::info!("send_to_ws_peer: successfully sent to peer {}", peer_id);
                     self.ws_peers.lock().await.insert(peer_id.to_owned(), s);
                     return true;
                 }
@@ -1073,7 +1060,6 @@ impl RendezvousServer {
             }
             true
         } else {
-            log::info!("send_to_ws_peer: NO sink found for peer {}, falling back to UDP", peer_id);
             false
         }
     }
@@ -1098,16 +1084,12 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<()> {
         let target_id = ph.id.clone();
-        log::info!("handle_tcp_punch_hole_request from {:?} for target '{}'", addr, target_id);
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
         if let Some(peer_addr) = to_addr {
-            log::info!("PunchHole: target '{}' online, trying WS first", target_id);
             if !self.send_to_ws_peer(&target_id, msg.clone()).await {
-                log::info!("PunchHole: falling back to UDP for '{}' at {:?}", target_id, peer_addr);
                 self.tx.send(Data::Msg(msg.into(), peer_addr))?;
             }
         } else {
-            log::info!("PunchHole: no target addr, sending response back to requester {:?}", addr);
             self.send_to_tcp_sync(msg, addr).await?;
         }
         Ok(())
