@@ -485,8 +485,11 @@ impl RendezvousServer {
                         }
                     }
                     if changed {
-                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+                        self.pm
+                            .update_pk(id.clone(), peer, addr, rk.uuid, rk.pk, ip)
+                            .await;
                     }
+                    self.ws_peers.lock().await.remove(&id);
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
                         result: register_pk_response::Result::OK.into(),
@@ -775,6 +778,7 @@ impl RendezvousServer {
         if let Some(old) = ip_change {
             log::info!("IP change of {} from {} to {}", id, old, socket_addr);
         }
+        self.ws_peers.lock().await.remove(&id);
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_register_peer_response(RegisterPeerResponse {
             request_pk,
