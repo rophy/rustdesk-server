@@ -45,6 +45,22 @@ static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024); // i
 const BLACKLIST_FILE: &str = "blacklist.txt";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
 
+pub(crate) struct RelayMetrics {
+    pub active_relays: usize,
+    pub waiting_peers: usize,
+    pub blacklisted_ips: usize,
+    pub blocklisted_ips: usize,
+}
+
+pub(crate) async fn collect_relay_metrics() -> RelayMetrics {
+    RelayMetrics {
+        active_relays: USAGE.read().await.len(),
+        waiting_peers: PEERS.lock().await.len(),
+        blacklisted_ips: BLACKLIST.read().await.len(),
+        blocklisted_ips: BLOCKLIST.read().await.len(),
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 pub async fn start_with_bind(
     bind_addr: Option<IpAddr>,
