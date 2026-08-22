@@ -189,7 +189,10 @@ impl PeerMap {
         let mut count = 0;
         for peer in &peers {
             let last_reg = peer.read().await.last_reg_time;
-            if now.duration_since(last_reg).as_secs() < threshold_secs {
+            if now
+                .checked_duration_since(last_reg)
+                .map_or(true, |elapsed| elapsed.as_secs() < threshold_secs)
+            {
                 count += 1;
             }
         }

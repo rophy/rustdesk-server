@@ -157,6 +157,9 @@ impl RendezvousServer {
         rs.parse_relay_servers(&get_arg("relay-servers"));
         if let Some(metrics_port) = get_arg_opt("metrics-port") {
             if let Ok(metrics_port) = metrics_port.parse::<u16>() {
+                if metrics_port == 0 {
+                    log::warn!("Invalid --metrics-port value, metrics server not started");
+                } else {
                 use prometheus::{Gauge, Opts};
                 let peers_registered = Gauge::with_opts(
                     Opts::new("rustdesk_hbbs_peers_registered", "Total peers in memory")
@@ -186,6 +189,7 @@ impl RendezvousServer {
                     })
                 });
                 tokio::spawn(crate::metrics::start_metrics_server(bind_addr, metrics_port, collector));
+                }
             } else {
                 log::warn!("Invalid --metrics-port value, metrics server not started");
             }
