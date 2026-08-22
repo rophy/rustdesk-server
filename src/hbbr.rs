@@ -38,6 +38,9 @@ fn main() -> ResultType<()> {
             port = v + 1;
         }
     }
+    if let Some(v) = matches.value_of("metrics-port") {
+        common::set_arg("metrics-port", v);
+    }
     let bind = matches
         .value_of("bind")
         .map(str::to_owned)
