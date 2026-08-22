@@ -68,6 +68,52 @@ pub async fn start_with_bind(
     key: &str,
 ) -> ResultType<()> {
     let key = get_server_sk(key);
+    if let Some(metrics_port) = crate::common::get_arg_opt("metrics-port") {
+        if let Ok(port) = metrics_port.parse::<u16>() {
+            let collector: std::sync::Arc<
+                dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send>>
+                    + Send
+                    + Sync,
+            > = std::sync::Arc::new(move || {
+                Box::pin(async move {
+                    use prometheus::{Encoder, TextEncoder, Registry, Gauge, Opts};
+                    let registry = Registry::new();
+
+                    let m = collect_relay_metrics().await;
+
+                    let active_relays = Gauge::with_opts(
+                        Opts::new("rustdesk_hbbr_active_relays", "Current active relay sessions")
+                    ).unwrap();
+                    let waiting_peers = Gauge::with_opts(
+                        Opts::new("rustdesk_hbbr_waiting_peers", "Peers waiting to be paired")
+                    ).unwrap();
+                    let blacklisted_ips = Gauge::with_opts(
+                        Opts::new("rustdesk_hbbr_blacklisted_ips", "IPs in the blacklist")
+                    ).unwrap();
+                    let blocklisted_ips = Gauge::with_opts(
+                        Opts::new("rustdesk_hbbr_blocklisted_ips", "IPs in the blocklist")
+                    ).unwrap();
+
+                    registry.register(Box::new(active_relays.clone())).unwrap();
+                    registry.register(Box::new(waiting_peers.clone())).unwrap();
+                    registry.register(Box::new(blacklisted_ips.clone())).unwrap();
+                    registry.register(Box::new(blocklisted_ips.clone())).unwrap();
+
+                    active_relays.set(m.active_relays as f64);
+                    waiting_peers.set(m.waiting_peers as f64);
+                    blacklisted_ips.set(m.blacklisted_ips as f64);
+                    blocklisted_ips.set(m.blocklisted_ips as f64);
+
+                    let encoder = TextEncoder::new();
+                    let metric_families = registry.gather();
+                    let mut buffer = Vec::new();
+                    encoder.encode(&metric_families, &mut buffer).unwrap();
+                    String::from_utf8(buffer).unwrap()
+                })
+            });
+            tokio::spawn(crate::metrics::start_metrics_server(bind_addr, port, collector));
+        }
+    }
     if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
