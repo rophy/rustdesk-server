@@ -155,6 +155,45 @@ impl RendezvousServer {
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
+        if let Some(metrics_port) = get_arg_opt("metrics-port") {
+            if let Ok(metrics_port) = metrics_port.parse::<u16>() {
+                if metrics_port == 0 {
+                    log::warn!("Invalid --metrics-port value, metrics server not started");
+                } else {
+                use prometheus::{Gauge, Opts};
+                let peers_registered = Gauge::with_opts(
+                    Opts::new("rustdesk_hbbs_peers_registered", "Total peers in memory")
+                ).unwrap();
+                let peers_online = Gauge::with_opts(
+                    Opts::new("rustdesk_hbbs_peers_online", "Peers with recent registration (within 30s)")
+                ).unwrap();
+                let ip_blocked = Gauge::with_opts(
+                    Opts::new("rustdesk_hbbs_ip_blocked", "Currently blocked IPs")
+                ).unwrap();
+                prometheus::register(Box::new(peers_registered.clone())).unwrap();
+                prometheus::register(Box::new(peers_online.clone())).unwrap();
+                prometheus::register(Box::new(ip_blocked.clone())).unwrap();
+
+                let pm = rs.pm.clone();
+                let collector: crate::metrics::Collector = std::sync::Arc::new(move || {
+                    let pm = pm.clone();
+                    let peers_registered = peers_registered.clone();
+                    let peers_online = peers_online.clone();
+                    let ip_blocked = ip_blocked.clone();
+                    Box::pin(async move {
+                        crate::metrics::encode_metrics(&[
+                            (peers_registered, pm.map_len().await as f64),
+                            (peers_online, pm.count_online(30).await as f64),
+                            (ip_blocked, IP_BLOCKER.lock().await.len() as f64),
+                        ])
+                    })
+                });
+                tokio::spawn(crate::metrics::start_metrics_server(bind_addr, metrics_port, collector));
+                }
+            } else {
+                log::warn!("Invalid --metrics-port value, metrics server not started");
+            }
+        }
         let mut listener = create_tcp_listener(bind_addr, port).await?;
         let mut listener2 = create_tcp_listener(bind_addr, nat_port).await?;
         let mut listener3 = create_tcp_listener(bind_addr, ws_port).await?;

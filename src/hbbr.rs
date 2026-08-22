@@ -1,5 +1,6 @@
 use clap::App;
 mod common;
+mod metrics;
 mod relay_server;
 use flexi_logger::*;
 use hbb_common::{config::RELAY_PORT, ResultType};
@@ -16,6 +17,7 @@ fn main() -> ResultType<()> {
         "-b, --bind=[IP] 'Sets the IP address to bind to (default: all interfaces)'
         -p, --port=[NUMBER(default={RELAY_PORT})] 'Sets the listening port'
         -k, --key=[KEY] 'Only allow the client with the same key'
+        -m, --metrics-port=[PORT] 'Starts a Prometheus metrics server on the given port'
         ",
     );
     let matches = App::new("hbbr")
@@ -35,6 +37,9 @@ fn main() -> ResultType<()> {
         if v > 0 {
             port = v + 1;
         }
+    }
+    if let Some(v) = matches.value_of("metrics-port") {
+        common::set_arg("metrics-port", v);
     }
     let bind = matches
         .value_of("bind")
