@@ -177,4 +177,22 @@ impl PeerMap {
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
     }
+
+    #[inline]
+    pub(crate) async fn map_len(&self) -> usize {
+        self.map.read().await.len()
+    }
+
+    pub(crate) async fn count_online(&self, threshold_secs: u64) -> usize {
+        let peers: Vec<_> = self.map.read().await.values().cloned().collect();
+        let now = Instant::now();
+        let mut count = 0;
+        for peer in &peers {
+            let last_reg = peer.read().await.last_reg_time;
+            if now.duration_since(last_reg).as_secs() < threshold_secs {
+                count += 1;
+            }
+        }
+        count
+    }
 }
