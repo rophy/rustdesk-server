@@ -48,6 +48,7 @@ enum Data {
 }
 
 const REG_TIMEOUT: i64 = 30_000;
+const WS_HEARTBEAT_INTERVAL: u64 = 20_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
@@ -1382,24 +1383,147 @@ impl RendezvousServer {
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
-            while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
-                if let tungstenite::Message::Binary(bytes) = msg {
-                    let (close, _registered_id) =
-                        self.handle_tcp(&bytes, &mut sink, addr, key, ws).await;
-                    if close {
+            let mut registered_peer_id: Option<String> = None;
+            loop {
+                let read_timeout = if registered_peer_id.is_some() {
+                    WS_HEARTBEAT_INTERVAL
+                } else {
+                    30_000
+                };
+                match timeout(read_timeout, b.next()).await {
+                    Ok(Some(Ok(msg))) => {
+                        if let tungstenite::Message::Binary(bytes) = msg {
+                            if bytes.is_empty() {
+                                if let Some(ref id) = registered_peer_id {
+                                    if let Some(peer) = self.pm.get_in_memory(id).await {
+                                        peer.write().await.last_reg_time = Instant::now();
+                                    }
+                                }
+                                continue;
+                            }
+                            let (close, new_reg_id) =
+                                self.handle_tcp(&bytes, &mut sink, addr, key, ws).await;
+                            if let Some(id) = new_reg_id {
+                                registered_peer_id = Some(id);
+                            }
+                            if close {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Some(Err(e))) => {
+                        log::debug!("WS read error from {:?}: {}", addr, e);
                         break;
                     }
+                    Ok(None) => {
+                        break;
+                    }
+                    Err(_) => {
+                        if let Some(ref id) = registered_peer_id {
+                            let sent = if let Some(Sink::Ws(ref mut ws_sink)) = sink {
+                                ws_sink
+                                    .send(tungstenite::Message::Binary(Vec::new()))
+                                    .await
+                                    .is_ok()
+                            } else {
+                                let mut ws_peers = self.ws_peers.lock().await;
+                                if let Some(s) = ws_peers.get_mut(id) {
+                                    match s {
+                                        Sink::Ws(ws) => ws
+                                            .send(tungstenite::Message::Binary(Vec::new()))
+                                            .await
+                                            .is_ok(),
+                                        Sink::TcpStream(tcp) => {
+                                            tcp.send(Bytes::new()).await.is_ok()
+                                        }
+                                    }
+                                } else {
+                                    false
+                                }
+                            };
+                            if !sent {
+                                log::debug!("Heartbeat send failed to {:?}, closing", addr);
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
                 }
+            }
+            if let Some(ref id) = registered_peer_id {
+                self.ws_peers.lock().await.remove(id);
+                log::info!("WS peer {} disconnected", id);
             }
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                let (close, _registered_id) =
-                    self.handle_tcp(&bytes, &mut sink, addr, key, ws).await;
-                if close {
-                    break;
+            let mut registered_peer_id: Option<String> = None;
+            loop {
+                let read_timeout = if registered_peer_id.is_some() {
+                    WS_HEARTBEAT_INTERVAL
+                } else {
+                    30_000
+                };
+                match timeout(read_timeout, b.next()).await {
+                    Ok(Some(Ok(bytes))) => {
+                        if bytes.is_empty() {
+                            if let Some(ref id) = registered_peer_id {
+                                if let Some(peer) = self.pm.get_in_memory(id).await {
+                                    peer.write().await.last_reg_time = Instant::now();
+                                }
+                            }
+                            continue;
+                        }
+                        let (close, new_reg_id) =
+                            self.handle_tcp(&bytes, &mut sink, addr, key, ws).await;
+                        if let Some(id) = new_reg_id {
+                            registered_peer_id = Some(id);
+                        }
+                        if close {
+                            break;
+                        }
+                    }
+                    Ok(Some(Err(e))) => {
+                        log::debug!("TCP read error from {:?}: {}", addr, e);
+                        break;
+                    }
+                    Ok(None) => {
+                        break;
+                    }
+                    Err(_) => {
+                        if let Some(ref id) = registered_peer_id {
+                            let sent = if let Some(Sink::TcpStream(ref mut tcp_sink)) = sink {
+                                tcp_sink.send(Bytes::new()).await.is_ok()
+                            } else {
+                                let mut ws_peers = self.ws_peers.lock().await;
+                                if let Some(s) = ws_peers.get_mut(id) {
+                                    match s {
+                                        Sink::Ws(ws) => ws
+                                            .send(tungstenite::Message::Binary(Vec::new()))
+                                            .await
+                                            .is_ok(),
+                                        Sink::TcpStream(tcp) => {
+                                            tcp.send(Bytes::new()).await.is_ok()
+                                        }
+                                    }
+                                } else {
+                                    false
+                                }
+                            };
+                            if !sent {
+                                log::debug!("Heartbeat send failed to {:?}, closing", addr);
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
                 }
+            }
+            if let Some(ref id) = registered_peer_id {
+                self.ws_peers.lock().await.remove(id);
+                log::info!("TCP peer {} disconnected", id);
             }
         }
         if sink.is_none() {
