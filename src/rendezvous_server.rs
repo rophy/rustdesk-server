@@ -569,12 +569,16 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                    let target_id = rf.id.clone();
+                    if let Some(peer) = self.pm.get_in_memory(&target_id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
-                        let peer_addr = peer.read().await.socket_addr;
-                        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        // Try WS first, fall back to UDP
+                        if !self.send_to_ws_peer(&target_id, msg_out.clone()).await {
+                            let peer_addr = peer.read().await.socket_addr;
+                            self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        }
                     }
                     return (false, None);
                 }
@@ -1058,9 +1062,13 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
+        let target_id = ph.id.clone();
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
-        if let Some(addr) = to_addr {
-            self.tx.send(Data::Msg(msg.into(), addr))?;
+        if let Some(peer_addr) = to_addr {
+            // Try WS first, fall back to UDP
+            if !self.send_to_ws_peer(&target_id, msg.clone()).await {
+                self.tx.send(Data::Msg(msg.into(), peer_addr))?;
+            }
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
         }
