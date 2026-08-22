@@ -155,6 +155,47 @@ impl RendezvousServer {
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
+        if let Some(metrics_port) = get_arg_opt("metrics-port") {
+            if let Ok(port) = metrics_port.parse::<u16>() {
+                let pm = rs.pm.clone();
+                let collector: std::sync::Arc<
+                    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send>>
+                        + Send
+                        + Sync,
+                > = std::sync::Arc::new(move || {
+                    let pm = pm.clone();
+                    Box::pin(async move {
+                        use prometheus::{Encoder, TextEncoder, Registry, Gauge, Opts};
+                        let registry = Registry::new();
+
+                        let peers_registered = Gauge::with_opts(
+                            Opts::new("rustdesk_hbbs_peers_registered", "Total peers in memory")
+                        ).unwrap();
+                        let peers_online = Gauge::with_opts(
+                            Opts::new("rustdesk_hbbs_peers_online", "Peers with recent registration (within 30s)")
+                        ).unwrap();
+                        let ip_blocked = Gauge::with_opts(
+                            Opts::new("rustdesk_hbbs_ip_blocked", "Currently blocked IPs")
+                        ).unwrap();
+
+                        registry.register(Box::new(peers_registered.clone())).unwrap();
+                        registry.register(Box::new(peers_online.clone())).unwrap();
+                        registry.register(Box::new(ip_blocked.clone())).unwrap();
+
+                        peers_registered.set(pm.map_len().await as f64);
+                        peers_online.set(pm.count_online(30).await as f64);
+                        ip_blocked.set(IP_BLOCKER.lock().await.len() as f64);
+
+                        let encoder = TextEncoder::new();
+                        let metric_families = registry.gather();
+                        let mut buffer = Vec::new();
+                        encoder.encode(&metric_families, &mut buffer).unwrap();
+                        String::from_utf8(buffer).unwrap()
+                    })
+                });
+                tokio::spawn(crate::metrics::start_metrics_server(bind_addr, port, collector));
+            }
+        }
         let mut listener = create_tcp_listener(bind_addr, port).await?;
         let mut listener2 = create_tcp_listener(bind_addr, nat_port).await?;
         let mut listener3 = create_tcp_listener(bind_addr, ws_port).await?;
