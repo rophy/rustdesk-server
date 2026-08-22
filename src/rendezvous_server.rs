@@ -558,7 +558,7 @@ impl RendezvousServer {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
                     allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
-                    return (true, None);
+                    return (false, None);
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
                     // there maybe several attempt, so sink can be none
@@ -572,7 +572,7 @@ impl RendezvousServer {
                         let peer_addr = peer.read().await.socket_addr;
                         self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
                     }
-                    return (true, None);
+                    return (false, None);
                 }
                 Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
                     let addr_b = AddrMangle::decode(&rr.socket_addr);
@@ -736,7 +736,7 @@ impl RendezvousServer {
                 _ => {}
             }
         }
-        (false, None)
+        (true, None)
     }
 
     #[inline]
