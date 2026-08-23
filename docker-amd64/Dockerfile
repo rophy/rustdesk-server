@@ -4,7 +4,7 @@ RUN apk add --no-cache musl-dev pkgconf openssl-dev openssl-libs-static file mak
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release
+RUN cargo build --release --all-features
 
 FROM scratch
 COPY --from=builder /build/target/release/hbbs /usr/bin/hbbs
