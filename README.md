@@ -42,7 +42,7 @@ cargo test --tests      # integration tests only (in tests/, spawns local hbbs/h
 ```
 
 Integration tests spawn local hbbs/hbbr processes, run protocol-level checks,
-and clean up automatically on exit.
+and clean up automatically on exit (Unix only, via `atexit` and `PR_SET_PDEATHSIG`).
 
 ## Configuration
 

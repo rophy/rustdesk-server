@@ -60,6 +60,7 @@ static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
 type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
+static WS_PEER_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 use once_cell::sync::Lazy;
 use tokio::sync::Mutex as TokioMutex;
@@ -89,7 +90,7 @@ struct Inner {
 #[derive(Clone)]
 pub struct RendezvousServer {
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
-    ws_peers: Arc<Mutex<HashMap<String, Sink>>>,
+    ws_peers: Arc<Mutex<HashMap<String, (u64, Sink)>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -559,7 +560,7 @@ impl RendezvousServer {
         addr: SocketAddr,
         key: &str,
         ws: bool,
-    ) -> (bool, Option<String>) {
+    ) -> (bool, Option<(String, u64)>) {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
@@ -606,12 +607,15 @@ impl RendezvousServer {
                     }
                     msg_out.set_relay_response(rr);
                     allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
+                    return (false, None);
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     allow_err!(self.handle_hole_sent(phs, addr, None).await);
+                    return (false, None);
                 }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
                     allow_err!(self.handle_local_addr(la, addr, None).await);
+                    return (false, None);
                 }
                 Some(rendezvous_message::Union::TestNatRequest(tar)) => {
                     let mut msg_out = RendezvousMessage::new();
@@ -627,6 +631,7 @@ impl RendezvousServer {
                     }
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
+                    return (false, None);
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
                     if rk.uuid.is_empty() || rk.pk.is_empty() {
@@ -747,10 +752,12 @@ impl RendezvousServer {
 
                     // Store the WS sink for this peer and signal persistent mode
                     if let Some(s) = sink.take() {
-                        self.ws_peers.lock().await.insert(id.clone(), s);
-                        log::info!("Peer {} registered via TCP/WS", id);
+                        let gen = WS_PEER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.ws_peers.lock().await.insert(id.clone(), (gen, s));
+                        log::info!("Peer {} registered via TCP/WS (gen={})", id, gen);
+                        return (false, Some((id, gen)));
                     }
-                    return (false, Some(id));
+                    return (false, None);
                 }
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
                     if rp.id.is_empty() {
@@ -811,7 +818,9 @@ impl RendezvousServer {
         if let Some(old) = ip_change {
             log::info!("IP change of {} from {} to {}", id, old, socket_addr);
         }
-        self.ws_peers.lock().await.remove(&id);
+        if !request_pk {
+            self.ws_peers.lock().await.remove(&id);
+        }
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_register_peer_response(RegisterPeerResponse {
             request_pk,
@@ -1051,15 +1060,15 @@ impl RendezvousServer {
     }
 
     async fn send_to_ws_peer(&self, peer_id: &str, msg: RendezvousMessage) -> bool {
-        let sink = self.ws_peers.lock().await.remove(peer_id);
-        if let Some(mut s) = sink {
+        let entry = self.ws_peers.lock().await.remove(peer_id);
+        if let Some((gen, mut s)) = entry {
             if let Ok(bytes) = msg.write_to_bytes() {
                 let ok = match &mut s {
                     Sink::TcpStream(tcp) => tcp.send(Bytes::from(bytes)).await.is_ok(),
                     Sink::Ws(ws) => ws.send(tungstenite::Message::Binary(bytes)).await.is_ok(),
                 };
                 if ok {
-                    self.ws_peers.lock().await.insert(peer_id.to_owned(), s);
+                    self.ws_peers.lock().await.insert(peer_id.to_owned(), (gen, s));
                     return true;
                 }
                 log::warn!("Failed to send to WS peer {}, removing sink", peer_id);
@@ -1417,9 +1426,9 @@ impl RendezvousServer {
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
-            let mut registered_peer_id: Option<String> = None;
+            let mut registered_peer: Option<(String, u64)> = None;
             loop {
-                let read_timeout = if registered_peer_id.is_some() {
+                let read_timeout = if registered_peer.is_some() {
                     *WS_HEARTBEAT_INTERVAL
                 } else {
                     30_000
@@ -1428,17 +1437,17 @@ impl RendezvousServer {
                     Ok(Some(Ok(msg))) => {
                         if let tungstenite::Message::Binary(bytes) = msg {
                             if bytes.is_empty() {
-                                if let Some(ref id) = registered_peer_id {
+                                if let Some((ref id, _)) = registered_peer {
                                     if let Some(peer) = self.pm.get_in_memory(id).await {
                                         peer.write().await.last_reg_time = Instant::now();
                                     }
                                 }
                                 continue;
                             }
-                            let (close, new_reg_id) =
+                            let (close, new_reg) =
                                 self.handle_tcp(&bytes, &mut sink, addr, key, ws).await;
-                            if let Some(id) = new_reg_id {
-                                registered_peer_id = Some(id);
+                            if let Some(reg) = new_reg {
+                                registered_peer = Some(reg);
                             }
                             if close {
                                 break;
@@ -1453,7 +1462,7 @@ impl RendezvousServer {
                         break;
                     }
                     Err(_) => {
-                        if let Some(ref id) = registered_peer_id {
+                        if let Some((ref id, _)) = registered_peer {
                             let sent = if let Some(Sink::Ws(ref mut ws_sink)) = sink {
                                 ws_sink
                                     .send(tungstenite::Message::Binary(Vec::new()))
@@ -1461,7 +1470,7 @@ impl RendezvousServer {
                                     .is_ok()
                             } else {
                                 let mut ws_peers = self.ws_peers.lock().await;
-                                if let Some(s) = ws_peers.get_mut(id) {
+                                if let Some((_, ref mut s)) = ws_peers.get_mut(id) {
                                     match s {
                                         Sink::Ws(ws) => ws
                                             .send(tungstenite::Message::Binary(Vec::new()))
@@ -1485,16 +1494,21 @@ impl RendezvousServer {
                     }
                 }
             }
-            if let Some(ref id) = registered_peer_id {
-                self.ws_peers.lock().await.remove(id);
-                log::info!("WS peer {} disconnected", id);
+            if let Some((ref id, gen)) = registered_peer {
+                let mut ws_peers = self.ws_peers.lock().await;
+                if let Some((stored_gen, _)) = ws_peers.get(id) {
+                    if *stored_gen == gen {
+                        ws_peers.remove(id);
+                        log::info!("WS peer {} disconnected (gen={})", id, gen);
+                    }
+                }
             }
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             sink = Some(Sink::TcpStream(a));
-            let mut registered_peer_id: Option<String> = None;
+            let mut registered_peer: Option<(String, u64)> = None;
             loop {
-                let read_timeout = if registered_peer_id.is_some() {
+                let read_timeout = if registered_peer.is_some() {
                     *WS_HEARTBEAT_INTERVAL
                 } else {
                     30_000
@@ -1502,17 +1516,17 @@ impl RendezvousServer {
                 match timeout(read_timeout, b.next()).await {
                     Ok(Some(Ok(bytes))) => {
                         if bytes.is_empty() {
-                            if let Some(ref id) = registered_peer_id {
+                            if let Some((ref id, _)) = registered_peer {
                                 if let Some(peer) = self.pm.get_in_memory(id).await {
                                     peer.write().await.last_reg_time = Instant::now();
                                 }
                             }
                             continue;
                         }
-                        let (close, new_reg_id) =
+                        let (close, new_reg) =
                             self.handle_tcp(&bytes, &mut sink, addr, key, ws).await;
-                        if let Some(id) = new_reg_id {
-                            registered_peer_id = Some(id);
+                        if let Some(reg) = new_reg {
+                            registered_peer = Some(reg);
                         }
                         if close {
                             break;
@@ -1526,12 +1540,12 @@ impl RendezvousServer {
                         break;
                     }
                     Err(_) => {
-                        if let Some(ref id) = registered_peer_id {
+                        if let Some((ref id, _)) = registered_peer {
                             let sent = if let Some(Sink::TcpStream(ref mut tcp_sink)) = sink {
                                 tcp_sink.send(Bytes::new()).await.is_ok()
                             } else {
                                 let mut ws_peers = self.ws_peers.lock().await;
-                                if let Some(s) = ws_peers.get_mut(id) {
+                                if let Some((_, ref mut s)) = ws_peers.get_mut(id) {
                                     match s {
                                         Sink::Ws(ws) => ws
                                             .send(tungstenite::Message::Binary(Vec::new()))
@@ -1555,9 +1569,14 @@ impl RendezvousServer {
                     }
                 }
             }
-            if let Some(ref id) = registered_peer_id {
-                self.ws_peers.lock().await.remove(id);
-                log::info!("TCP peer {} disconnected", id);
+            if let Some((ref id, gen)) = registered_peer {
+                let mut ws_peers = self.ws_peers.lock().await;
+                if let Some((stored_gen, _)) = ws_peers.get(id) {
+                    if *stored_gen == gen {
+                        ws_peers.remove(id);
+                        log::info!("TCP peer {} disconnected (gen={})", id, gen);
+                    }
+                }
             }
         }
         if sink.is_none() {

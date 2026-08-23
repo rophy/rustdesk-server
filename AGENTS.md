@@ -13,7 +13,8 @@
 - `cargo test` runs all tests.
 - `cargo test --lib` runs unit tests only (in `src/`).
 - `cargo test --tests` runs integration tests only (in `tests/`).
-- Integration tests spawn local hbbs/hbbr processes and clean up via `Drop`.
+- Integration tests spawn local hbbs/hbbr processes. On Unix, cleanup uses
+  `libc::atexit` (SIGTERM on exit) and `PR_SET_PDEATHSIG` (SIGTERM if parent dies).
 
 ## Editing Hygiene
 
