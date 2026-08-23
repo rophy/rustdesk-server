@@ -6,7 +6,7 @@ use hbb_common::{
     },
 };
 use std::{
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, Command},
     sync::{Mutex, OnceLock},
@@ -14,15 +14,37 @@ use std::{
 };
 use tokio::time::timeout;
 
-const HBBS_PORT: u16 = 31116;
-const HBBR_PORT: u16 = 31117;
-
-fn hbbs_ws_port() -> u16 {
-    HBBS_PORT + 2
+fn find_free_port_range() -> (u16, u16) {
+    // hbbs uses: base (TCP+UDP), base-1 (NAT), base+2 (WS)
+    // hbbr uses: base (TCP+UDP), base+2 (WS)
+    // Find a base port where base-1, base, base+2 are all free.
+    for _ in 0..100 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind to port 0");
+        let base = listener.local_addr().unwrap().port();
+        drop(listener);
+        if base < 3 { continue; }
+        let needed = [base - 1, base, base + 2];
+        let all_free = needed.iter().all(|&p| {
+            TcpListener::bind(("127.0.0.1", p)).is_ok()
+        });
+        if all_free {
+            // Use base for hbbs, base+3 for hbbr (avoid overlap)
+            let hbbr_base = base + 3;
+            let hbbr_ports = [hbbr_base, hbbr_base + 2];
+            let hbbr_free = hbbr_ports.iter().all(|&p| {
+                TcpListener::bind(("127.0.0.1", p)).is_ok()
+            });
+            if hbbr_free {
+                return (base, hbbr_base);
+            }
+        }
+    }
+    panic!("Could not find a free port range");
 }
 
 struct TestServer {
     _data_dir: PathBuf,
+    hbbs_port: u16,
 }
 
 static SERVER: OnceLock<TestServer> = OnceLock::new();
@@ -52,17 +74,33 @@ impl TestServer {
     fn start() -> Self {
         Self::build_binaries();
 
+        let (hbbs_port, hbbr_port) = find_free_port_range();
+
         let data_dir = std::env::temp_dir().join(format!("rustdesk_test_{}", std::process::id()));
         std::fs::create_dir_all(&data_dir).expect("create temp data dir");
 
-        let hbbr = Self::spawn(&Self::find_binary("hbbr"), &data_dir, &[
-            "-p", &HBBR_PORT.to_string(),
-        ]);
+        // Spawn server processes from a dedicated thread that never exits,
+        // so PR_SET_PDEATHSIG only fires when the entire process dies.
+        let data_dir_clone = data_dir.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("server-spawner".into())
+            .spawn(move || {
+                let hbbr = Self::spawn(&Self::find_binary("hbbr"), &data_dir_clone, &[
+                    "-p", &hbbr_port.to_string(),
+                ], &[]);
 
-        let hbbs = Self::spawn(&Self::find_binary("hbbs"), &data_dir, &[
-            "-p", &HBBS_PORT.to_string(),
-            "-r", &format!("localhost:{}", HBBR_PORT),
-        ]);
+                let hbbs = Self::spawn(&Self::find_binary("hbbs"), &data_dir_clone, &[
+                    "-p", &hbbs_port.to_string(),
+                    "-r", &format!("localhost:{}", hbbr_port),
+                ], &[("WS_HEARTBEAT_INTERVAL", "500")]);
+
+                tx.send((hbbr, hbbs)).unwrap();
+                // Park forever — PR_SET_PDEATHSIG is tied to this thread's lifetime
+                std::thread::park();
+            })
+            .expect("spawn server-spawner thread");
+        let (hbbr, hbbs) = rx.recv().unwrap();
 
         {
             let mut pids = CHILD_PIDS.lock().unwrap();
@@ -75,10 +113,10 @@ impl TestServer {
 
         let server = TestServer {
             _data_dir: data_dir,
+            hbbs_port,
         };
         server.wait_ready();
 
-        // Leak the Child handles — cleanup is via atexit + PR_SET_PDEATHSIG
         std::mem::forget(hbbs);
         std::mem::forget(hbbr);
 
@@ -94,11 +132,12 @@ impl TestServer {
     }
 
     #[cfg(unix)]
-    fn spawn(bin: &PathBuf, data_dir: &PathBuf, args: &[&str]) -> Child {
+    fn spawn(bin: &PathBuf, data_dir: &PathBuf, args: &[&str], envs: &[(&str, &str)]) -> Child {
         use std::os::unix::process::CommandExt;
         unsafe {
             Command::new(bin)
                 .args(args)
+                .envs(envs.iter().copied())
                 .current_dir(data_dir)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -112,9 +151,10 @@ impl TestServer {
     }
 
     #[cfg(not(unix))]
-    fn spawn(bin: &PathBuf, data_dir: &PathBuf, args: &[&str]) -> Child {
+    fn spawn(bin: &PathBuf, data_dir: &PathBuf, args: &[&str], envs: &[(&str, &str)]) -> Child {
         Command::new(bin)
             .args(args)
+            .envs(envs.iter().copied())
             .current_dir(data_dir)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -134,8 +174,12 @@ impl TestServer {
         path
     }
 
+    fn ws_port(&self) -> u16 {
+        self.hbbs_port + 2
+    }
+
     fn wait_ready(&self) {
-        let ws_addr = format!("127.0.0.1:{}", hbbs_ws_port());
+        let ws_addr = format!("127.0.0.1:{}", self.ws_port());
         for _ in 0..100 {
             if TcpStream::connect(&ws_addr).is_ok() {
                 return;
@@ -146,42 +190,43 @@ impl TestServer {
     }
 }
 
-static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PROBED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
-async fn wait_server_functional() {
-    server();
-    if PROBED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
-    }
-    // TCP listen doesn't mean the server is fully initialized.
-    // Probe with a short-ID registration until we get a response.
-    for _ in 0..30 {
-        if let Ok((mut ws, _)) =
-            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", hbbs_ws_port()))
-                .await
-        {
-            let mut msg = RendezvousMessage::new();
-            msg.set_register_pk(RegisterPk {
-                id: "x".into(),
-                uuid: vec![0u8; 16].into(),
-                pk: vec![0u8; 32].into(),
-                ..Default::default()
-            });
-            let bytes = msg.write_to_bytes().unwrap();
-            if ws.send(tungstenite::Message::Binary(bytes)).await.is_ok() {
-                if let Ok(Some(Ok(_))) = timeout(Duration::from_secs(5), ws.next()).await {
-                    return;
+async fn wait_server_functional() -> &'static TestServer {
+    let s = server();
+    PROBED
+        .get_or_init(|| async {
+            let ws_port = s.ws_port();
+            for _ in 0..30 {
+                if let Ok((mut ws, _)) =
+                    tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", ws_port)).await
+                {
+                    let mut msg = RendezvousMessage::new();
+                    msg.set_register_pk(RegisterPk {
+                        id: "x".into(),
+                        uuid: vec![0u8; 16].into(),
+                        pk: vec![0u8; 32].into(),
+                        ..Default::default()
+                    });
+                    let bytes = msg.write_to_bytes().unwrap();
+                    if ws.send(tungstenite::Message::Binary(bytes)).await.is_ok() {
+                        if let Ok(Some(Ok(_))) = timeout(Duration::from_secs(5), ws.next()).await {
+                            return;
+                        }
+                    }
                 }
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    panic!("hbbs did not become functionally ready within 15s");
+            panic!("hbbs did not become functionally ready within 15s");
+        })
+        .await;
+    s
 }
 
 async fn ws_connect(
+    s: &TestServer,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    let url = format!("ws://127.0.0.1:{}", hbbs_ws_port());
+    let url = format!("ws://127.0.0.1:{}", s.ws_port());
     let (ws, _) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("Failed to connect to hbbs WS");
@@ -239,9 +284,9 @@ fn extract_register_pk_result(
 
 #[tokio::test]
 async fn register_pk_over_ws_returns_ok() {
-    wait_server_functional().await;
+    let s = wait_server_functional().await;
 
-    let mut ws = ws_connect().await;
+    let mut ws = ws_connect(s).await;
     send_msg(&mut ws, make_register_pk("test-peer-reg-001")).await;
 
     let resp = recv_msg(&mut ws, 5000)
@@ -255,9 +300,9 @@ async fn register_pk_over_ws_returns_ok() {
 
 #[tokio::test]
 async fn register_pk_short_id_rejected() {
-    wait_server_functional().await;
+    let s = wait_server_functional().await;
 
-    let mut ws = ws_connect().await;
+    let mut ws = ws_connect(s).await;
     send_msg(&mut ws, make_register_pk("abc")).await;
 
     let resp = recv_msg(&mut ws, 5000)
@@ -271,9 +316,9 @@ async fn register_pk_short_id_rejected() {
 
 #[tokio::test]
 async fn ws_connection_receives_heartbeat_after_registration() {
-    wait_server_functional().await;
+    let s = wait_server_functional().await;
 
-    let mut ws = ws_connect().await;
+    let mut ws = ws_connect(s).await;
     send_msg(&mut ws, make_register_pk("test-peer-hb-001")).await;
 
     let resp = recv_msg(&mut ws, 5000)
@@ -284,14 +329,14 @@ async fn ws_connection_receives_heartbeat_after_registration() {
         EnumOrUnknown::from(register_pk_response::Result::OK),
     );
 
-    // Server sends heartbeat (empty binary) at ~20s timeout
-    let heartbeat = timeout(Duration::from_secs(25), ws.next()).await;
+    // Server sends heartbeat (empty binary) at WS_HEARTBEAT_INTERVAL (500ms in tests)
+    let heartbeat = timeout(Duration::from_secs(3), ws.next()).await;
     match heartbeat {
         Ok(Some(Ok(tungstenite::Message::Binary(data)))) => {
             assert!(data.is_empty(), "Heartbeat should be empty bytes");
         }
         other => panic!(
-            "Expected empty binary heartbeat within 25s, got {:?}",
+            "Expected empty binary heartbeat within 3s, got {:?}",
             other
         ),
     }
@@ -299,9 +344,9 @@ async fn ws_connection_receives_heartbeat_after_registration() {
 
 #[tokio::test]
 async fn register_pk_empty_uuid_gets_no_response() {
-    wait_server_functional().await;
+    let s = wait_server_functional().await;
 
-    let mut ws = ws_connect().await;
+    let mut ws = ws_connect(s).await;
 
     let mut msg = RendezvousMessage::new();
     msg.set_register_pk(RegisterPk {

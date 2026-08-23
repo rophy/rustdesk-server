@@ -48,7 +48,6 @@ enum Data {
 }
 
 const REG_TIMEOUT: i64 = 30_000;
-const WS_HEARTBEAT_INTERVAL: u64 = 20_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
@@ -62,9 +61,16 @@ type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 
-// Store punch hole requests
 use once_cell::sync::Lazy;
-use tokio::sync::Mutex as TokioMutex; // differentiate if needed
+use tokio::sync::Mutex as TokioMutex;
+
+static WS_HEARTBEAT_INTERVAL: Lazy<u64> = Lazy::new(|| {
+    get_arg_or("ws-heartbeat-interval", "20000".to_owned())
+        .parse()
+        .unwrap_or(20_000)
+});
+
+// Store punch hole requests
 #[derive(Clone)]
 struct PunchReqEntry { tm: Instant, from_ip: String, to_ip: String, to_id: String }
 static PUNCH_REQS: Lazy<TokioMutex<Vec<PunchReqEntry>>> = Lazy::new(|| TokioMutex::new(Vec::new()));
@@ -1414,7 +1420,7 @@ impl RendezvousServer {
             let mut registered_peer_id: Option<String> = None;
             loop {
                 let read_timeout = if registered_peer_id.is_some() {
-                    WS_HEARTBEAT_INTERVAL
+                    *WS_HEARTBEAT_INTERVAL
                 } else {
                     30_000
                 };
@@ -1489,7 +1495,7 @@ impl RendezvousServer {
             let mut registered_peer_id: Option<String> = None;
             loop {
                 let read_timeout = if registered_peer_id.is_some() {
-                    WS_HEARTBEAT_INTERVAL
+                    *WS_HEARTBEAT_INTERVAL
                 } else {
                     30_000
                 };
