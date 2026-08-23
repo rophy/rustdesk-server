@@ -136,14 +136,47 @@ impl TestServer {
 
     fn wait_ready(&self) {
         let ws_addr = format!("127.0.0.1:{}", hbbs_ws_port());
-        for _ in 0..50 {
+        for _ in 0..100 {
             if TcpStream::connect(&ws_addr).is_ok() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        panic!("hbbs did not become ready on {} within 5s", ws_addr);
+        panic!("hbbs did not become ready on {} within 10s", ws_addr);
     }
+}
+
+static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+async fn wait_server_functional() {
+    server();
+    if PROBED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    // TCP listen doesn't mean the server is fully initialized.
+    // Probe with a short-ID registration until we get a response.
+    for _ in 0..30 {
+        if let Ok((mut ws, _)) =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", hbbs_ws_port()))
+                .await
+        {
+            let mut msg = RendezvousMessage::new();
+            msg.set_register_pk(RegisterPk {
+                id: "x".into(),
+                uuid: vec![0u8; 16].into(),
+                pk: vec![0u8; 32].into(),
+                ..Default::default()
+            });
+            let bytes = msg.write_to_bytes().unwrap();
+            if ws.send(tungstenite::Message::Binary(bytes)).await.is_ok() {
+                if let Ok(Some(Ok(_))) = timeout(Duration::from_secs(5), ws.next()).await {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("hbbs did not become functionally ready within 15s");
 }
 
 async fn ws_connect(
@@ -206,7 +239,7 @@ fn extract_register_pk_result(
 
 #[tokio::test]
 async fn register_pk_over_ws_returns_ok() {
-    let _s = server();
+    wait_server_functional().await;
 
     let mut ws = ws_connect().await;
     send_msg(&mut ws, make_register_pk("test-peer-reg-001")).await;
@@ -222,7 +255,7 @@ async fn register_pk_over_ws_returns_ok() {
 
 #[tokio::test]
 async fn register_pk_short_id_rejected() {
-    let _s = server();
+    wait_server_functional().await;
 
     let mut ws = ws_connect().await;
     send_msg(&mut ws, make_register_pk("abc")).await;
@@ -238,7 +271,7 @@ async fn register_pk_short_id_rejected() {
 
 #[tokio::test]
 async fn ws_connection_receives_heartbeat_after_registration() {
-    let _s = server();
+    wait_server_functional().await;
 
     let mut ws = ws_connect().await;
     send_msg(&mut ws, make_register_pk("test-peer-hb-001")).await;
@@ -266,7 +299,7 @@ async fn ws_connection_receives_heartbeat_after_registration() {
 
 #[tokio::test]
 async fn register_pk_empty_uuid_gets_no_response() {
-    let _s = server();
+    wait_server_functional().await;
 
     let mut ws = ws_connect().await;
 
