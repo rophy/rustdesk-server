@@ -9,5 +9,6 @@ RUN cargo build --release --all-features
 FROM scratch
 COPY --from=builder /build/target/release/hbbs /usr/bin/hbbs
 COPY --from=builder /build/target/release/hbbr /usr/bin/hbbr
-WORKDIR /root
-ENV HOME=/root
+WORKDIR /data
+ENV HOME=/data
+USER 1000:1000
