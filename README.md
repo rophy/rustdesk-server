@@ -33,6 +33,17 @@ Three executables will be generated in target/release.
 
 You can find updated binaries on the [Releases](https://github.com/rustdesk/rustdesk-server/releases) page.
 
+## Testing
+
+```bash
+cargo test              # run all tests
+cargo test --lib        # unit tests only (fast, in src/)
+cargo test --tests      # integration tests only (in tests/, spawns local hbbs/hbbr)
+```
+
+Integration tests spawn local hbbs/hbbr processes, run protocol-level checks,
+and clean up automatically on exit.
+
 ## Configuration
 
 `hbbs` and `hbbr` can be configured with command-line flags, environment
