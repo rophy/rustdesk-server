@@ -9,6 +9,7 @@ use std::{
     net::TcpStream,
     path::PathBuf,
     process::{Child, Command},
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
 use tokio::time::timeout;
@@ -21,58 +22,114 @@ fn hbbs_ws_port() -> u16 {
 }
 
 struct TestServer {
-    hbbs: Child,
-    hbbr: Child,
-    data_dir: PathBuf,
+    _data_dir: PathBuf,
+}
+
+static SERVER: OnceLock<TestServer> = OnceLock::new();
+static CHILD_PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+fn server() -> &'static TestServer {
+    SERVER.get_or_init(|| TestServer::start())
+}
+
+#[cfg(unix)]
+extern "C" fn cleanup_children() {
+    if let Ok(pids) = CHILD_PIDS.lock() {
+        for &pid in pids.iter() {
+            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        for &pid in pids.iter() {
+            unsafe {
+                let mut status = 0;
+                libc::waitpid(pid as i32, &mut status, libc::WNOHANG);
+            }
+        }
+    }
 }
 
 impl TestServer {
     fn start() -> Self {
+        Self::build_binaries();
+
         let data_dir = std::env::temp_dir().join(format!("rustdesk_test_{}", std::process::id()));
         std::fs::create_dir_all(&data_dir).expect("create temp data dir");
 
-        let hbbr_bin = Self::find_binary("hbbr");
-        let hbbs_bin = Self::find_binary("hbbs");
+        let hbbr = Self::spawn(&Self::find_binary("hbbr"), &data_dir, &[
+            "-p", &HBBR_PORT.to_string(),
+        ]);
 
-        let hbbr = Command::new(&hbbr_bin)
-            .args(["-p", &HBBR_PORT.to_string()])
-            .current_dir(&data_dir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("Failed to start hbbr");
+        let hbbs = Self::spawn(&Self::find_binary("hbbs"), &data_dir, &[
+            "-p", &HBBS_PORT.to_string(),
+            "-r", &format!("localhost:{}", HBBR_PORT),
+        ]);
 
-        let hbbs = Command::new(&hbbs_bin)
-            .args([
-                "-p",
-                &HBBS_PORT.to_string(),
-                "-r",
-                &format!("localhost:{}", HBBR_PORT),
-            ])
-            .current_dir(&data_dir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("Failed to start hbbs");
+        {
+            let mut pids = CHILD_PIDS.lock().unwrap();
+            pids.push(hbbr.id());
+            pids.push(hbbs.id());
+        }
+
+        #[cfg(unix)]
+        unsafe { libc::atexit(cleanup_children); }
 
         let server = TestServer {
-            hbbs,
-            hbbr,
-            data_dir,
+            _data_dir: data_dir,
         };
         server.wait_ready();
+
+        // Leak the Child handles — cleanup is via atexit + PR_SET_PDEATHSIG
+        std::mem::forget(hbbs);
+        std::mem::forget(hbbr);
+
         server
     }
 
+    fn build_binaries() {
+        let status = Command::new("cargo")
+            .args(["build", "--bin", "hbbs", "--bin", "hbbr"])
+            .status()
+            .expect("Failed to run cargo build");
+        assert!(status.success(), "cargo build failed");
+    }
+
+    #[cfg(unix)]
+    fn spawn(bin: &PathBuf, data_dir: &PathBuf, args: &[&str]) -> Child {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            Command::new(bin)
+                .args(args)
+                .current_dir(data_dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                    Ok(())
+                })
+                .spawn()
+                .unwrap_or_else(|e| panic!("Failed to start {}: {}", bin.display(), e))
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn spawn(bin: &PathBuf, data_dir: &PathBuf, args: &[&str]) -> Child {
+        Command::new(bin)
+            .args(args)
+            .current_dir(data_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("Failed to start {}: {}", bin.display(), e))
+    }
+
     fn find_binary(name: &str) -> PathBuf {
-        let mut path = std::env::current_exe()
+        let path = std::env::current_exe()
             .expect("locate test binary")
             .parent()
             .expect("test binary parent")
             .parent()
             .expect("deps parent")
-            .to_path_buf();
-        path.push(name);
+            .join(name);
         assert!(path.exists(), "Binary not found: {}", path.display());
         path
     }
@@ -86,16 +143,6 @@ impl TestServer {
             std::thread::sleep(Duration::from_millis(100));
         }
         panic!("hbbs did not become ready on {} within 5s", ws_addr);
-    }
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        self.hbbs.kill().ok();
-        self.hbbr.kill().ok();
-        self.hbbs.wait().ok();
-        self.hbbr.wait().ok();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -159,7 +206,7 @@ fn extract_register_pk_result(
 
 #[tokio::test]
 async fn register_pk_over_ws_returns_ok() {
-    let _server = TestServer::start();
+    let _s = server();
 
     let mut ws = ws_connect().await;
     send_msg(&mut ws, make_register_pk("test-peer-reg-001")).await;
@@ -175,7 +222,7 @@ async fn register_pk_over_ws_returns_ok() {
 
 #[tokio::test]
 async fn register_pk_short_id_rejected() {
-    let _server = TestServer::start();
+    let _s = server();
 
     let mut ws = ws_connect().await;
     send_msg(&mut ws, make_register_pk("abc")).await;
@@ -191,7 +238,7 @@ async fn register_pk_short_id_rejected() {
 
 #[tokio::test]
 async fn ws_connection_receives_heartbeat_after_registration() {
-    let _server = TestServer::start();
+    let _s = server();
 
     let mut ws = ws_connect().await;
     send_msg(&mut ws, make_register_pk("test-peer-hb-001")).await;
@@ -219,7 +266,7 @@ async fn ws_connection_receives_heartbeat_after_registration() {
 
 #[tokio::test]
 async fn register_pk_empty_uuid_gets_no_response() {
-    let _server = TestServer::start();
+    let _s = server();
 
     let mut ws = ws_connect().await;
 
